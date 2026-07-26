@@ -35,11 +35,17 @@ cleanup() {
   echo "shutting down…"
   [ -n "$NGROK_PID" ] && kill "$NGROK_PID" 2>/dev/null || true
   [ -n "$SERVE_PID" ] && kill "$SERVE_PID" 2>/dev/null || true
+  # npx starts `serve` through an npm wrapper, so killing the pid we hold can leave the node
+  # process that actually owns the port. Sweep for it by name.
+  pkill -f "serve -l $PORT" 2>/dev/null || true
   # Always hand the repo back the way we found it, including on a failed build.
   git switch --quiet "$START_BRANCH" 2>/dev/null || true
   echo "done. you are on $START_BRANCH"
 }
-trap cleanup EXIT INT TERM
+# Only EXIT runs cleanup; the signal traps just exit, or teardown would print twice.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 build() {
   local branch="$1" dest="$2" base="$3"
