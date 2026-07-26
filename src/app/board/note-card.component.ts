@@ -16,22 +16,24 @@ import { UserService } from '../core/user.service';
 import { VotePinsComponent } from './vote-pins.component';
 
 /**
- * One sticky note, rendering its children inline.
+ * One square sticky note.
  *
- * Nesting is plain flex layout: a child is a DOM child of its parent's `.children` container, so the
- * parent grows to fit and moving the parent moves the whole subtree with zero layout maths. Only
- * root cards are absolutely positioned (by the board), in world coordinates.
+ * Fixed size, so the docking layout stays predictable: long text steps down a font size or two and
+ * then clips under a fade rather than resizing the square. The card renders only itself — children
+ * are separate squares positioned around it by the board.
  */
 @Component({
   selector: 'app-note-card',
   changeDetection: ChangeDetectionStrategy.OnPush,
   imports: [VotePinsComponent],
   host: {
-    '[attr.data-note-id]': 'ghost() ? null : note().id',
-    '[class.is-dragging]': 'isDragging()',
-    '[class.is-ghost]': 'ghost()',
-    '[class.drop-ok]': 'dropState() === "ok"',
-    '[class.drop-bad]': 'dropState() === "bad"',
+    '[attr.data-note-id]': 'note().id',
+    '[class.is-dragging]': 'dragging()',
+    '[class.drop-bad]': 'rejected()',
+    '[class.dock-left]': 'activeSide() === "left"',
+    '[class.dock-right]': 'activeSide() === "right"',
+    '[class.dock-top]': 'activeSide() === "top"',
+    '[class.dock-bottom]': 'activeSide() === "bottom"',
     '[style.--sticky]': 'type().color',
     '[style.--accent]': 'type().accent',
     '[style.--ink]': 'type().ink',
@@ -42,14 +44,13 @@ import { VotePinsComponent } from './vote-pins.component';
       <span class="spacer"></span>
       @if (childCount() > 0) {
         <button class="icon" type="button" (pointerdown)="$event.stopPropagation()"
-                (click)="toggleCollapse()" [title]="note().collapsed ? 'Expand' : 'Collapse'">
-          {{ note().collapsed ? '▸' : '▾' }}
+                (click)="toggleCollapse()"
+                [title]="note().collapsed ? 'Show attached notes' : 'Hide attached notes'">
+          {{ note().collapsed ? '+' + childCount() : '−' }}
         </button>
       }
-      @if (!ghost()) {
-        <button class="icon danger" type="button" (pointerdown)="$event.stopPropagation()"
-                (click)="remove()" title="Delete note and its children">×</button>
-      }
+      <button class="icon danger" type="button" (pointerdown)="$event.stopPropagation()"
+              (click)="remove()" title="Delete note and everything attached to it">×</button>
     </header>
 
     <div class="body" (dblclick)="startEditing()">
@@ -59,15 +60,15 @@ import { VotePinsComponent } from './vote-pins.component';
           class="editor"
           [value]="note().text"
           [placeholder]="type().placeholder"
+          [style.font-size.px]="fontSize()"
           (pointerdown)="$event.stopPropagation()"
           (blur)="commit(editor.value)"
           (keydown)="onEditorKey($event, editor)"
-          (input)="autosize(editor)"
         ></textarea>
-      } @else if (note().text) {
-        <p class="text">{{ note().text }}</p>
       } @else {
-        <p class="text placeholder">{{ type().placeholder }}</p>
+        <p class="text" [class.placeholder]="!note().text" [style.font-size.px]="fontSize()">
+          {{ note().text || type().placeholder }}
+        </p>
       }
     </div>
 
@@ -76,56 +77,63 @@ import { VotePinsComponent } from './vote-pins.component';
       <span class="author">{{ author().name }}</span>
     </footer>
 
-    @if (!note().collapsed) {
-      <div class="children" [attr.data-children-of]="ghost() ? null : note().id">
-        @for (child of children(); track child.id; let i = $index) {
-          @if (insertAt() === i) { <div class="insert"></div> }
-          <!-- ghost propagates so the dragged copy never shadows real drop-target selectors -->
-          <app-note-card [note]="child" [ghost]="ghost()" />
-        }
-        @if (insertAt() === childCount()) { <div class="insert"></div> }
-        @if (childCount() === 0 && accepts().length) {
-          <p class="slot">Drop {{ acceptsLabel() }} here</p>
-        }
-      </div>
+    @if (childCount() === 0 && accepts().length) {
+      <span class="hint">attach {{ acceptsLabel() }} to any side</span>
     }
   `,
   styles: `
     :host {
       display: flex;
       flex-direction: column;
+      position: relative;
+      width: 100%;
+      height: 100%;
       background: var(--sticky);
       color: var(--ink);
-      border-radius: 8px;
-      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.18), 0 6px 14px -8px rgba(15, 23, 42, 0.35);
-      transition: box-shadow 0.15s, outline-color 0.15s, transform 0.15s;
+      border-radius: 4px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.2), 0 8px 16px -10px rgba(15, 23, 42, 0.4);
+      transition: box-shadow 0.12s, outline-color 0.12s;
       outline: 2px solid transparent;
-      outline-offset: 2px;
+      outline-offset: 1px;
+      overflow: hidden;
     }
-    :host(.is-dragging) { opacity: 0.35; pointer-events: none; }
-    :host(.is-ghost) {
-      transform: rotate(1.5deg);
-      box-shadow: 0 18px 32px -12px rgba(15, 23, 42, 0.55);
+    :host(.is-dragging) {
+      box-shadow: 0 20px 34px -14px rgba(15, 23, 42, 0.6);
+      cursor: grabbing;
     }
-    :host(.drop-ok) { outline-color: var(--accent); }
     :host(.drop-bad) { outline-color: #dc2626; }
     :host(.drop-bad) .body { opacity: 0.5; }
+
+    /* The edge a drop would dock to lights up, so the direction is committed before release. */
+    :host(.dock-left)::after,
+    :host(.dock-right)::after,
+    :host(.dock-top)::after,
+    :host(.dock-bottom)::after {
+      content: '';
+      position: absolute;
+      background: var(--accent);
+    }
+    :host(.dock-left)::after { inset: 0 auto 0 0; width: 5px; }
+    :host(.dock-right)::after { inset: 0 0 0 auto; width: 5px; }
+    :host(.dock-top)::after { inset: 0 0 auto 0; height: 5px; }
+    :host(.dock-bottom)::after { inset: auto 0 0 0; height: 5px; }
 
     .head {
       display: flex;
       align-items: center;
-      gap: 6px;
-      padding: 5px 6px 3px 8px;
+      gap: 4px;
+      padding: 6px 5px 2px 9px;
       cursor: grab;
       touch-action: none;
+      flex: 0 0 auto;
     }
     .head:active { cursor: grabbing; }
     .spacer { flex: 1; }
 
     .chip {
-      font-size: 10px;
+      font-size: 9px;
       font-weight: 700;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.07em;
       text-transform: uppercase;
       color: var(--accent);
     }
@@ -134,40 +142,44 @@ import { VotePinsComponent } from './vote-pins.component';
       border: 0;
       background: transparent;
       color: inherit;
-      opacity: 0.45;
+      opacity: 0.4;
       cursor: pointer;
-      font-size: 13px;
+      font-size: 12px;
       line-height: 1;
       padding: 2px 4px;
-      border-radius: 4px;
+      border-radius: 3px;
     }
     .icon:hover { opacity: 1; background: rgba(255, 255, 255, 0.6); }
     .icon.danger:hover { color: #b91c1c; }
 
-    .body { padding: 0 10px 6px; }
+    .body {
+      flex: 1 1 auto;
+      position: relative;
+      padding: 2px 10px 0;
+      overflow: hidden;
+      /* Clipped text fades out instead of being cut mid-line. */
+      mask-image: linear-gradient(#000 calc(100% - 14px), transparent);
+    }
     .text {
       margin: 0;
-      font-size: 13px;
-      line-height: 1.35;
+      line-height: 1.3;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
-      min-height: 18px;
     }
-    .text.placeholder { opacity: 0.45; font-style: italic; }
+    .text.placeholder { opacity: 0.4; font-style: italic; }
 
     .editor {
       width: 100%;
+      height: 100%;
       border: 0;
-      border-radius: 4px;
+      border-radius: 3px;
       padding: 2px 4px;
       margin: -2px -4px;
-      background: rgba(255, 255, 255, 0.75);
+      background: rgba(255, 255, 255, 0.8);
       color: inherit;
       font: inherit;
-      font-size: 13px;
-      line-height: 1.35;
+      line-height: 1.3;
       resize: none;
-      overflow: hidden;
       outline: 1px solid var(--accent);
     }
 
@@ -175,39 +187,20 @@ import { VotePinsComponent } from './vote-pins.component';
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 8px;
-      padding: 0 8px 6px;
-      font-size: 11px;
+      gap: 6px;
+      padding: 4px 8px 6px;
+      font-size: 10px;
+      flex: 0 0 auto;
     }
-    .author { opacity: 0.5; }
+    .author { opacity: 0.45; }
 
-    .children {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      padding: 8px;
-      margin: 0 4px 4px;
-      border-radius: 6px;
-      background: rgba(255, 255, 255, 0.35);
-      min-height: 12px;
-    }
-    .children:empty { display: none; }
-
-    .insert {
-      height: 3px;
-      margin: -1px 0;
-      border-radius: 2px;
-      background: var(--accent);
-    }
-
-    .slot {
-      margin: 0;
-      padding: 8px 6px;
-      border: 1px dashed currentColor;
-      border-radius: 5px;
-      opacity: 0.35;
-      font-size: 11px;
+    .hint {
+      position: absolute;
+      inset: auto 0 -16px 0;
       text-align: center;
+      font-size: 9px;
+      color: #94a3b8;
+      pointer-events: none;
     }
   `,
 })
@@ -218,15 +211,12 @@ export class NoteCardComponent {
   private readonly host = inject(ElementRef<HTMLElement>);
 
   readonly note = input.required<Note>();
-  /** Ghost copies follow the cursor and must not participate in hit-testing or editing. */
-  readonly ghost = input(false);
 
   private readonly editor = viewChild<ElementRef<HTMLTextAreaElement>>('editor');
   readonly editing = signal(false);
 
   readonly type = computed(() => noteType(this.note().typeId));
-  readonly children = computed(() => this.store.childrenOf(this.note().id));
-  readonly childCount = computed(() => this.children().length);
+  readonly childCount = computed(() => this.store.childrenOf(this.note().id).length);
   readonly author = computed(() => this.users.byId(this.note().createdBy));
   readonly accepts = computed(() => acceptedChildTypes(this.note().typeId));
   readonly acceptsLabel = computed(() =>
@@ -235,44 +225,32 @@ export class NoteCardComponent {
       .join(' or '),
   );
 
-  readonly isDragging = computed(() => !this.ghost() && this.dragService.isDragging(this.note().id));
-
-  /** 'ok' | 'bad' | null — the highlight shown while something hovers this card. */
-  readonly dropState = computed(() => {
-    if (this.ghost()) return null;
-    const target = this.dragService.drag()?.target;
-    if (!target || target.parentId !== this.note().id) return null;
-    return target.valid ? 'ok' : 'bad';
+  /** Two steps down before clipping — enough for a sentence or two at full size. */
+  readonly fontSize = computed(() => {
+    const length = this.note().text.length;
+    if (length > 150) return 10;
+    if (length > 70) return 12;
+    return 14;
   });
 
-  /**
-   * Slot index to draw the insertion line at, or -1.
-   *
-   * The store's index excludes the note being dragged, so when that note is already a child here we
-   * shift the line down past its (still rendered, faded) placeholder to keep the preview honest.
-   */
-  readonly insertAt = computed(() => {
-    if (this.ghost()) return -1;
-    const drag = this.dragService.drag();
-    const target = drag?.target;
-    if (!target?.valid || target.parentId !== this.note().id) return -1;
-    const from = this.children().findIndex((c) => c.id === drag!.noteId);
-    return from >= 0 && from < target.index ? target.index + 1 : target.index;
+  readonly dragging = computed(() => this.dragService.draggingIds().has(this.note().id));
+  readonly activeSide = computed(() => this.dragService.activeSideFor(this.note().id));
+  readonly rejected = computed(() => {
+    const target = this.dragService.drag()?.target;
+    return !!target && !target.valid && target.parentId === this.note().id;
   });
 
   onGrab(event: PointerEvent): void {
-    if (this.ghost() || this.editing() || event.button !== 0) return;
+    if (this.editing() || event.button !== 0) return;
     event.stopPropagation();
-    this.dragService.beginMove(event, this.note(), this.host.nativeElement);
+    this.dragService.beginMove(event, this.note());
   }
 
   startEditing(): void {
-    if (this.ghost()) return;
     this.editing.set(true);
     queueMicrotask(() => {
       const el = this.editor()?.nativeElement;
       if (!el) return;
-      this.autosize(el);
       el.focus();
       el.setSelectionRange(el.value.length, el.value.length);
     });
@@ -292,11 +270,6 @@ export class NoteCardComponent {
   commit(text: string): void {
     this.store.setText(this.note().id, text.trim());
     this.editing.set(false);
-  }
-
-  autosize(el: HTMLTextAreaElement): void {
-    el.style.height = 'auto';
-    el.style.height = `${el.scrollHeight}px`;
   }
 
   toggleCollapse(): void {

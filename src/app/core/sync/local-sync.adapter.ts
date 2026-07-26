@@ -5,7 +5,9 @@ import { BoardState } from '../models/note.model';
 import { seedBoard } from './seed-board';
 import { SyncAdapter } from './sync-adapter';
 
-const STORAGE_KEY = 'floating-notes:board';
+// Versioned: a board saved before notes carried a `side` would lay out with its children missing,
+// so a shape change takes the key with it rather than needing a migration.
+const STORAGE_KEY = 'floating-notes:board:v2';
 const WRITE_DEBOUNCE_MS = 250;
 
 /**

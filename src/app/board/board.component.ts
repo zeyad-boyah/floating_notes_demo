@@ -1,7 +1,8 @@
 import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { BoardStore } from '../core/board.store';
 import { DragService } from '../core/drag.service';
-import { isDescendantOf } from '../core/models/note.model';
+import { NOTE_GAP, NOTE_SIZE } from '../core/layout';
+import { Note, isDescendantOf } from '../core/models/note.model';
 import { noteType } from '../core/note-types';
 import { ViewportService } from '../core/viewport.service';
 import { NoteCardComponent } from './note-card.component';
@@ -10,12 +11,28 @@ import { UserSwitcherComponent } from './user-switcher.component';
 
 const ZOOM_STEP = 1.15;
 
+interface PlacedNote {
+  note: Note;
+  x: number;
+  y: number;
+  dragging: boolean;
+}
+
+interface Connector {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  color: string;
+}
+
 /**
- * The board surface: pan/zoom viewport, the world layer holding root notes, and the drag ghost.
+ * The board surface: pan/zoom viewport, every square positioned from the computed layout, and the
+ * connector stubs that make an attachment visible rather than merely adjacent.
  *
- * The world layer carries a single `translate(...) scale(...)`, so every descendant is positioned in
- * world coordinates and zoom costs nothing per note. The ghost lives outside that layer, in screen
- * space, because it must track the cursor exactly regardless of where the board has been panned.
+ * Notes are rendered flat — nesting is expressed by position, not by DOM containment — so a cluster
+ * of any depth costs one absolutely positioned element per note.
  */
 @Component({
   selector: 'app-board',
@@ -30,27 +47,42 @@ const ZOOM_STEP = 1.15;
   },
   template: `
     <div class="world" [style.transform]="viewport.transform()">
-      @for (root of store.roots(); track root.id) {
-        <div class="root" [style.left.px]="root.x" [style.top.px]="root.y">
-          <app-note-card [note]="root" />
+      @for (link of connectors(); track link.id) {
+        <span
+          class="link"
+          [style.left.px]="link.x"
+          [style.top.px]="link.y"
+          [style.width.px]="link.w"
+          [style.height.px]="link.h"
+          [style.background]="link.color"
+        ></span>
+      }
+      @for (placed of placedNotes(); track placed.note.id) {
+        <div
+          class="square"
+          [class.lifted]="placed.dragging"
+          [style.left.px]="placed.x"
+          [style.top.px]="placed.y"
+          [style.width.px]="SIZE"
+          [style.height.px]="SIZE"
+        >
+          <app-note-card [note]="placed.note" />
         </div>
       }
     </div>
 
     @if (drag.drag(); as d) {
-      <div
-        class="ghost"
-        [style.left.px]="d.screenX"
-        [style.top.px]="d.screenY"
-        [style.width.px]="d.width"
-        [style.transform]="'scale(' + viewport.scale() + ')'"
-      >
-        @if (ghostNote(); as note) {
-          <app-note-card [note]="note" [ghost]="true" />
-        }
-      </div>
       @if (!d.target?.valid) {
         <p class="reject">{{ rejectReason(d.typeId) }}</p>
+      }
+      @if (d.kind === 'create' && d.target?.valid) {
+        <div
+          class="new-ghost"
+          [style.transform]="ghostTransform(d.worldX, d.worldY)"
+          [style.width.px]="SIZE"
+          [style.height.px]="SIZE"
+          [style.background]="ghostColor(d.typeId)"
+        ></div>
       }
     }
 
@@ -65,7 +97,7 @@ const ZOOM_STEP = 1.15;
       <button type="button" (click)="resetBoard()">Reset board</button>
     </div>
     <p class="hud bottom-right hint">
-      Drag the background to pan · wheel to zoom · double-click a note to edit
+      Drag the background to pan · wheel to zoom · drop a note on any edge to attach it
     </p>
   `,
   styles: `
@@ -89,12 +121,19 @@ const ZOOM_STEP = 1.15;
       left: 0;
       transform-origin: 0 0;
     }
-    .root { position: absolute; width: 280px; }
 
-    .ghost {
+    .square { position: absolute; }
+    .square.lifted { z-index: 20; }
+
+    .link { position: absolute; border-radius: 1px; opacity: 0.55; }
+
+    .new-ghost {
       position: fixed;
       z-index: 50;
       transform-origin: 0 0;
+      border-radius: 4px;
+      opacity: 0.7;
+      box-shadow: 0 18px 30px -14px rgba(15, 23, 42, 0.6);
       pointer-events: none;
     }
 
@@ -163,6 +202,7 @@ export class BoardComponent {
   readonly drag = inject(DragService);
 
   protected readonly ZOOM_STEP = ZOOM_STEP;
+  protected readonly SIZE = NOTE_SIZE;
 
   private panFrom: { x: number; y: number } | null = null;
   private readonly panActive = signal(false);
@@ -170,25 +210,74 @@ export class BoardComponent {
 
   readonly zoomPercent = computed(() => Math.round(this.viewport.scale() * 100));
 
-  /** The note the ghost renders — an existing note, or a stand-in for a palette drag. */
-  readonly ghostNote = computed(() => {
-    const d = this.drag.drag();
-    if (!d) return null;
-    if (d.noteId) return this.store.get(d.noteId) ?? null;
-    return {
-      id: '__new__',
-      typeId: d.typeId,
-      parentId: null,
-      text: '',
-      x: 0,
-      y: 0,
-      order: 0,
-      votes: [],
-      createdBy: '',
-      collapsed: false,
-      updatedAt: 0,
-    };
+  /**
+   * Laid-out notes, with the dragged cluster shifted to follow the cursor. The offset is applied
+   * here rather than written to the store, so an abandoned drag needs no undo.
+   */
+  readonly placedNotes = computed<PlacedNote[]>(() => {
+    const layout = this.store.layout();
+    const delta = this.drag.dragDelta();
+    const moving = this.drag.draggingIds();
+    const out: PlacedNote[] = [];
+
+    for (const note of Object.values(this.store.notes())) {
+      const place = layout[note.id];
+      if (!place) continue; // hidden inside a collapsed parent
+      const dragging = moving.has(note.id);
+      out.push({
+        note,
+        x: place.x + (dragging && delta ? delta.dx : 0),
+        y: place.y + (dragging && delta ? delta.dy : 0),
+        dragging,
+      });
+    }
+    return out;
   });
+
+  /** A short bar bridging the gap between a parent edge and each note docked to it. */
+  readonly connectors = computed<Connector[]>(() => {
+    const placed = new Map(this.placedNotes().map((p) => [p.note.id, p]));
+    const links: Connector[] = [];
+
+    for (const child of placed.values()) {
+      const note = child.note;
+      if (!note.parentId || !note.side) continue;
+      const parent = placed.get(note.parentId);
+      if (!parent) continue;
+      // Only draw where the pair is still in its resting arrangement; a half-dragged cluster
+      // would otherwise sprout a bar stretching across the board.
+      if (child.dragging !== parent.dragging) continue;
+
+      const color = noteType(note.typeId).accent;
+      const id = `l-${note.id}`;
+      const cx = child.x + NOTE_SIZE / 2;
+      const cy = child.y + NOTE_SIZE / 2;
+      switch (note.side) {
+        case 'right':
+          links.push({ id, x: parent.x + NOTE_SIZE, y: cy - 1.5, w: NOTE_GAP, h: 3, color });
+          break;
+        case 'left':
+          links.push({ id, x: child.x + NOTE_SIZE, y: cy - 1.5, w: NOTE_GAP, h: 3, color });
+          break;
+        case 'bottom':
+          links.push({ id, x: cx - 1.5, y: parent.y + NOTE_SIZE, w: 3, h: NOTE_GAP, color });
+          break;
+        case 'top':
+          links.push({ id, x: cx - 1.5, y: child.y + NOTE_SIZE, w: 3, h: NOTE_GAP, color });
+          break;
+      }
+    }
+    return links;
+  });
+
+  ghostTransform(worldX: number, worldY: number): string {
+    const screen = this.viewport.worldToScreen(worldX, worldY);
+    return `translate(${screen.x}px, ${screen.y}px) scale(${this.viewport.scale()})`;
+  }
+
+  ghostColor(typeId: string): string {
+    return noteType(typeId).color;
+  }
 
   onPointerDown(event: PointerEvent): void {
     // Cards stop propagation on their own grab handles, so anything reaching here is background.
@@ -216,8 +305,7 @@ export class BoardComponent {
 
   onWheel(event: WheelEvent): void {
     event.preventDefault();
-    const factor = Math.pow(ZOOM_STEP, -event.deltaY / 100);
-    this.viewport.zoomAt(event.clientX, event.clientY, factor);
+    this.viewport.zoomAt(event.clientX, event.clientY, Math.pow(ZOOM_STEP, -event.deltaY / 100));
   }
 
   zoom(factor: number): void {
@@ -235,12 +323,13 @@ export class BoardComponent {
     const target = d?.target;
     const parent = target?.parentId ? this.store.get(target.parentId) : null;
     const type = noteType(typeId);
-    if (!parent) {
-      return `A ${type.label.toLowerCase()} can't sit on the board on its own`;
+    if (!parent) return `A ${type.label.toLowerCase()} can't sit on the board on its own`;
+    if (
+      d?.noteId &&
+      (parent.id === d.noteId || isDescendantOf({ notes: this.store.notes() }, parent.id, d.noteId))
+    ) {
+      return `A note can't be attached to itself`;
     }
-    if (d?.noteId && (parent.id === d.noteId || isDescendantOf({ notes: this.store.notes() }, parent.id, d.noteId))) {
-      return `A note can't be dropped inside itself`;
-    }
-    return `A ${type.label.toLowerCase()} can't go inside a ${noteType(parent.typeId).label.toLowerCase()}`;
+    return `A ${type.label.toLowerCase()} can't attach to a ${noteType(parent.typeId).label.toLowerCase()}`;
   }
 }

@@ -1,11 +1,24 @@
 import { DestroyRef, Injectable, computed, inject, signal } from '@angular/core';
 import { BoardEvent } from './models/board-event.model';
-import { BoardState, EMPTY_BOARD, Note, isDescendantOf, subtreeIds } from './models/note.model';
+import { layoutBoard } from './layout';
+import {
+  BoardState,
+  EMPTY_BOARD,
+  Note,
+  SIDES,
+  Side,
+  isDescendantOf,
+  subtreeIds,
+} from './models/note.model';
 import { canAttach } from './note-types';
 import { seedBoard } from './sync/seed-board';
 import { SYNC_ADAPTER } from './sync/sync-adapter';
 
 const ROOT_KEY = '__root__';
+
+function groupKey(parentId: string | null, side: Side | null): string {
+  return parentId === null ? ROOT_KEY : `${parentId}|${side}`;
+}
 
 /**
  * Pure reducer — the single place board state changes.
@@ -29,6 +42,7 @@ export function applyEvent(state: BoardState, event: BoardEvent): BoardState {
       if (!note) return state;
       return patch(state, event.id, {
         parentId: event.parentId,
+        side: event.side,
         order: event.order,
         x: event.x ?? note.x,
         y: event.y ?? note.y,
@@ -77,12 +91,14 @@ export class BoardStore {
     inject(DestroyRef).onDestroy(() => sub.unsubscribe());
   }
 
-  /** Children grouped by parentId (roots under ROOT_KEY), each list sorted by `order`. */
+  /**
+   * Children grouped by (parentId, side) — roots under ROOT_KEY — each list sorted by `order`.
+   * Ordering is per side, because each side of a square is its own stack.
+   */
   private readonly grouped = computed(() => {
     const groups: Record<string, Note[]> = {};
     for (const note of Object.values(this.state().notes)) {
-      const key = note.parentId ?? ROOT_KEY;
-      (groups[key] ??= []).push(note);
+      (groups[groupKey(note.parentId, note.side)] ??= []).push(note);
     }
     for (const list of Object.values(groups)) list.sort((a, b) => a.order - b.order);
     return groups;
@@ -92,8 +108,13 @@ export class BoardStore {
   readonly roots = computed(() => this.grouped()[ROOT_KEY] ?? []);
   readonly count = computed(() => Object.keys(this.state().notes).length);
 
-  childrenOf(id: string): Note[] {
-    return this.grouped()[id] ?? [];
+  /** Where every note sits, derived from the roots outward. */
+  readonly layout = computed(() => layoutBoard(this.state()));
+
+  /** All children of a note, or just those docked to one side. */
+  childrenOf(id: string, side?: Side): Note[] {
+    if (side) return this.grouped()[groupKey(id, side)] ?? [];
+    return SIDES.flatMap((s) => this.grouped()[groupKey(id, s)] ?? []);
   }
 
   get(id: string): Note | undefined {
@@ -129,11 +150,16 @@ export class BoardStore {
   }
 
   /**
-   * A sort key that places a note at `index` among the children of `parentId`.
+   * A sort key that places a note at `index` in the (parentId, side) stack.
    * Sparse gaps of 1000 mean inserts almost never have to renumber siblings.
    */
-  orderForIndex(parentId: string | null, index: number, excludeId?: string): number {
-    const siblings = (this.grouped()[parentId ?? ROOT_KEY] ?? []).filter(
+  orderForIndex(
+    parentId: string | null,
+    side: Side | null,
+    index: number,
+    excludeId?: string,
+  ): number {
+    const siblings = (this.grouped()[groupKey(parentId, side)] ?? []).filter(
       (n) => n.id !== excludeId,
     );
     const clamped = Math.max(0, Math.min(index, siblings.length));
@@ -147,20 +173,23 @@ export class BoardStore {
 
   createNote(typeId: string, opts: {
     parentId: string | null;
+    side?: Side | null;
     x?: number;
     y?: number;
     index?: number;
     createdBy: string;
   }): Note | null {
     if (!this.canDrop(typeId, opts.parentId)) return null;
+    const side = opts.parentId === null ? null : opts.side ?? 'right';
     const note: Note = {
       id: `n-${Math.random().toString(36).slice(2, 10)}`,
       typeId,
       parentId: opts.parentId,
+      side,
       text: '',
       x: opts.x ?? 0,
       y: opts.y ?? 0,
-      order: this.orderForIndex(opts.parentId, opts.index ?? Number.MAX_SAFE_INTEGER),
+      order: this.orderForIndex(opts.parentId, side, opts.index ?? Number.MAX_SAFE_INTEGER),
       votes: [],
       createdBy: opts.createdBy,
       collapsed: false,
@@ -180,15 +209,23 @@ export class BoardStore {
   }
 
   /** Returns false (and changes nothing) when the type rules or cycle guard reject the drop. */
-  reparent(id: string, parentId: string | null, index: number, world?: { x: number; y: number }): boolean {
+  reparent(
+    id: string,
+    parentId: string | null,
+    side: Side | null,
+    index: number,
+    world?: { x: number; y: number },
+  ): boolean {
     const note = this.get(id);
     if (!note) return false;
     if (!this.canDrop(note.typeId, parentId, id)) return false;
+    const docked = parentId === null ? null : side ?? 'right';
     this.dispatch({
       t: 'reparent',
       id,
       parentId,
-      order: this.orderForIndex(parentId, index, id),
+      side: docked,
+      order: this.orderForIndex(parentId, docked, index, id),
       ...(parentId === null && world ? { x: world.x, y: world.y } : {}),
     });
     return true;

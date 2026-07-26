@@ -63,6 +63,6 @@ export class PaletteComponent {
     const type = NOTE_TYPES[typeId];
     if (type.canBeRoot) return 'goes on the board';
     const parents = type.allowedParents.map((p) => NOTE_TYPES[p].label.toLowerCase());
-    return `inside a ${parents.join(' or ')}`;
+    return `onto a ${parents.join(' or ')}`;
   }
 }

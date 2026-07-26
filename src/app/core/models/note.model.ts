@@ -1,3 +1,7 @@
+/** Which edge of a parent square a note docks to. */
+export type Side = 'left' | 'right' | 'top' | 'bottom';
+export const SIDES: Side[] = ['left', 'right', 'top', 'bottom'];
+
 /**
  * A single sticky note on the board.
  *
@@ -9,11 +13,13 @@ export interface Note {
   typeId: string;
   /** null = the note sits directly on the board. */
   parentId: string | null;
+  /** Which edge of the parent this note is docked to. null for roots. */
+  side: Side | null;
   text: string;
-  /** World coordinates. Only meaningful while `parentId` is null. */
+  /** World coordinates. Only meaningful while `parentId` is null — docked notes are laid out. */
   x: number;
   y: number;
-  /** Sort key among siblings (or among roots). Sparse, so inserts rarely need a renumber. */
+  /** Sort key within (parent, side). Sparse, so inserts rarely need a renumber. */
   order: number;
   /** userIds that voted for this note. One vote per user. */
   votes: string[];

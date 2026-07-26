@@ -1,15 +1,22 @@
 import { provideZonelessChangeDetection } from '@angular/core';
 import { TestBed } from '@angular/core/testing';
 import { BoardStore, applyEvent } from './board.store';
-import { BoardState, Note } from './models/note.model';
+import { BoardState, Note, Side } from './models/note.model';
 import { LocalSyncAdapter } from './sync/local-sync.adapter';
 import { SYNC_ADAPTER } from './sync/sync-adapter';
 
-function note(id: string, typeId: string, parentId: string | null, order = 1000): Note {
+function note(
+  id: string,
+  typeId: string,
+  parentId: string | null,
+  side: Side | null = parentId ? 'right' : null,
+  order = 1000,
+): Note {
   return {
     id,
     typeId,
     parentId,
+    side,
     text: '',
     x: 0,
     y: 0,
@@ -79,41 +86,64 @@ describe('BoardStore', () => {
 
   afterEach(() => localStorage.clear());
 
-  it('refuses a reparent that breaks the type rules', () => {
-    expect(store.reparent('a', 't', 0)).toBe(false);
+  it('refuses an attachment that breaks the type rules', () => {
+    expect(store.reparent('a', 't', 'right', 0)).toBe(false);
     expect(store.get('a')!.parentId).toBe('i');
   });
 
-  it('refuses to nest a note inside itself or its own descendant', () => {
-    expect(store.reparent('t', 't', 0)).toBe(false);
-    expect(store.reparent('t', 'i', 0)).toBe(false);
-    expect(store.reparent('t', 'a', 0)).toBe(false);
+  it('refuses to attach a note to itself or to its own descendant', () => {
+    expect(store.reparent('t', 't', 'right', 0)).toBe(false);
+    expect(store.reparent('t', 'i', 'right', 0)).toBe(false);
+    expect(store.reparent('t', 'a', 'right', 0)).toBe(false);
     expect(store.get('t')!.parentId).toBeNull();
   });
 
-  it('refuses to drop a non-root type onto the board', () => {
-    expect(store.reparent('i', null, 0, { x: 10, y: 10 })).toBe(false);
+  it('refuses to drop a non-root type loose on the board', () => {
+    expect(store.reparent('i', null, null, 0, { x: 10, y: 10 })).toBe(false);
     expect(store.get('i')!.parentId).toBe('t');
   });
 
-  it('accepts a legal reparent between two themes', () => {
+  it('accepts a legal move between two themes and records the side', () => {
     store.dispatch({ t: 'create', note: note('t2', 'theme', null) });
-    expect(store.reparent('i', 't2', 0)).toBe(true);
+    expect(store.reparent('i', 't2', 'bottom', 0)).toBe(true);
     expect(store.get('i')!.parentId).toBe('t2');
+    expect(store.get('i')!.side).toBe('bottom');
     expect(store.childrenOf('t').length).toBe(0);
-    expect(store.childrenOf('t2').map((n) => n.id)).toEqual(['i']);
+    expect(store.childrenOf('t2', 'bottom').map((n) => n.id)).toEqual(['i']);
   });
 
-  it('orders siblings by the index given to reparent', () => {
-    store.dispatch({ t: 'create', note: note('i2', 'idea', 't', 2000) });
-    store.dispatch({ t: 'create', note: note('i3', 'idea', 't', 3000) });
-    store.reparent('i3', 't', 0);
-    expect(store.childrenOf('t').map((n) => n.id)).toEqual(['i3', 'i', 'i2']);
+  it('keeps each side of a square as its own ordered stack', () => {
+    store.dispatch({ t: 'create', note: note('i2', 'idea', 't', 'right', 2000) });
+    store.dispatch({ t: 'create', note: note('i3', 'idea', 't', 'top', 3000) });
+
+    expect(store.childrenOf('t', 'right').map((n) => n.id)).toEqual(['i', 'i2']);
+    expect(store.childrenOf('t', 'top').map((n) => n.id)).toEqual(['i3']);
+    expect(store.childrenOf('t').length).toBe(3);
+
+    // Moving to index 0 of the right-hand stack puts it ahead of both existing notes.
+    store.reparent('i3', 't', 'right', 0);
+    expect(store.childrenOf('t', 'right').map((n) => n.id)).toEqual(['i3', 'i', 'i2']);
+    expect(store.childrenOf('t', 'top').length).toBe(0);
+  });
+
+  it('lays out a moved note on its new side, carrying its own attachments', () => {
+    const before = store.layout();
+    expect(before['i'].x).toBeGreaterThan(before['t'].x);
+
+    store.reparent('i', 't', 'left', 0);
+    const after = store.layout();
+    expect(after['i'].x).toBeLessThan(after['t'].x);
+    // The action is docked to the idea's right, so it stays one step to the idea's right and
+    // travels with it — which here happens to land it back over the theme. Docking is relative to
+    // the parent only; it does not avoid collisions elsewhere in the cluster.
+    expect(after['a'].x - after['i'].x).toBe(before['a'].x - before['i'].x);
+    expect(after['a'].y).toBe(after['i'].y);
   });
 
   it('will not create a note that the rules disallow', () => {
     expect(store.createNote('action', { parentId: 't', createdBy: 'u-ada' })).toBeNull();
     expect(store.createNote('idea', { parentId: null, createdBy: 'u-ada' })).toBeNull();
-    expect(store.createNote('idea', { parentId: 't', createdBy: 'u-ada' })).not.toBeNull();
+    expect(store.createNote('idea', { parentId: 't', side: 'top', createdBy: 'u-ada' })).not.toBeNull();
+    expect(store.childrenOf('t', 'top').length).toBe(1);
   });
 });
