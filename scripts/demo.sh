@@ -157,7 +157,7 @@ NGROK_PID=$!
 PUBLIC_URL=""
 for _ in $(seq 1 20); do
   PUBLIC_URL="$(curl -s http://localhost:4040/api/tunnels 2>/dev/null \
-    | grep -oE '"public_url":"https://[^"]*"' | head -1 | cut -d'"' -f4)"
+    | grep -oE '"public_url":"https://[^"]*"' | head -1 | cut -d'"' -f4 || true)"
   [ -n "$PUBLIC_URL" ] && break
   sleep 1
 done
